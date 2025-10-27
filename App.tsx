@@ -7,6 +7,7 @@ import { Placeholder } from './components/Placeholder';
 import { GenerationStatus } from './components/GenerationStatus';
 import { COMMODITIES, PODCAST_STORAGE_BASE_URL } from './constants';
 import { generatePodcastScript, generatePodcastAudio } from './services/geminiService';
+import { getAudioFromCache, putAudioInCache } from './services/cacheService';
 import type { Commodity } from './types';
 
 function base64ToBlob(base64: string, contentType: string = 'audio/mpeg'): Blob {
@@ -44,9 +45,15 @@ export default function App() {
       for (const commodity of COMMODITIES) {
         const url = `${PODCAST_STORAGE_BASE_URL}/podcast_${commodity.id}.mp3`;
         try {
-          const response = await fetch(url, { method: 'HEAD', cache: 'no-store' });
-          if (response.ok) {
+          // Check cache first for faster verification
+          const cached = await getAudioFromCache(url);
+          if (cached) {
             generatedCount++;
+          } else {
+            const response = await fetch(url, { method: 'HEAD', cache: 'no-store' });
+            if (response.ok) {
+              generatedCount++;
+            }
           }
         } catch (e) {
           // Ignore fetch errors, treat as file not found
@@ -75,13 +82,18 @@ export default function App() {
             
             setManualAudioUrls(prev => ({...prev, [commodity.id]: objectUrl}));
             
+            // Cache the manually generated blob
+            const urlToCache = `${PODCAST_STORAGE_BASE_URL}/podcast_${commodity.id}.mp3`;
+            const responseToCache = new Response(audioBlob, {
+                headers: { 'Content-Type': 'audio/mpeg' }
+            });
+            await putAudioInCache(urlToCache, responseToCache);
+            
             const currentProgress = Math.round(((index + 1) / COMMODITIES.length) * 100);
             setGenerationProgress(currentProgress);
         }
     } catch (e: any) {
         setError(e.message || 'Une erreur est survenue lors de la génération manuelle.');
-        // If an error occurs, still mark generation as finished
-        setIsManualGenerating(false);
     } finally {
         setIsManualGenerating(false);
     }
@@ -94,13 +106,38 @@ export default function App() {
     
     setSelectedCommodity(commodity);
     setError(null);
+    setAudioUrl(null); // Show loading briefly
 
-    // Prioritize manually generated audio from the current session
+    // 1. Prioritize manually generated audio from the current session
     if (manualAudioUrls[commodity.id]) {
       setAudioUrl(manualAudioUrls[commodity.id]);
-    } else {
-      const url = `${PODCAST_STORAGE_BASE_URL}/podcast_${commodity.id}.mp3`;
-      setAudioUrl(url);
+      return;
+    } 
+
+    const url = `${PODCAST_STORAGE_BASE_URL}/podcast_${commodity.id}.mp3`;
+
+    // 2. Check cache for pre-generated file
+    const cachedResponse = await getAudioFromCache(url);
+    if (cachedResponse) {
+        const audioBlob = await cachedResponse.blob();
+        setAudioUrl(URL.createObjectURL(audioBlob));
+        return;
+    }
+
+    // 3. If not in cache, use network URL and cache it for next time
+    setAudioUrl(url); // Let the player stream directly from the network
+    
+    // Fetch and cache in the background for subsequent plays
+    try {
+        const networkResponse = await fetch(url);
+        if (networkResponse.ok) {
+            await putAudioInCache(url, networkResponse);
+        } else {
+             // The player's onError will handle the user-facing error.
+             console.warn(`Failed to cache ${url}, status: ${networkResponse.status}`);
+        }
+    } catch (e) {
+        console.error(`Failed to fetch and cache ${url}`, e);
     }
 
   }, [selectedCommodity, manualAudioUrls]);
